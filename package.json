@@ -1,0 +1,47 @@
+{
+  "name": "ghost-blog-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "publish": "node scripts/publish.mjs",
+    "test:e2e": "node test/e2e.mjs",
+    "dev": "docker compose up -d && echo 'Ghost running at http://localhost:2368'",
+    "down": "docker compose down",
+    "nuke": "docker compose down -v",
+    "lint": "eslint --max-warnings 0 .",
+    "lint:fix": "eslint --fix .",
+    "check:syntax": "node --check lib/ghost.mjs && node --check scripts/publish.mjs && node --check scripts/configure-ghost.mjs && node --check test/e2e.mjs",
+    "check:shell": "shellcheck scripts/*.sh",
+    "check:yaml": "node -e \"const y=require('yaml'); const fs=require('fs'); y.parse(fs.readFileSync('docker-compose.yml','utf8')); console.log('docker-compose.yml: OK')\"",
+    "check:all": "npm run lint && npm run check:syntax && npm run check:yaml",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "marked": "^15.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0",
+    "globals": "^16.0.0",
+    "husky": "^9.1.0",
+    "lint-staged": "^15.4.0",
+    "yaml": "^2.7.0"
+  },
+  "lint-staged": {
+    "*.mjs": [
+      "eslint --max-warnings 0",
+      "node --check"
+    ],
+    "*.sh": [
+      "bash -n"
+    ],
+    "*.yml": [
+      "node -e \"const y=require('yaml'); const fs=require('fs'); y.parse(fs.readFileSync(process.argv[1],'utf8')); console.log(process.argv[1]+': OK')\""
+    ],
+    "*.md": [
+      "node -e \"const fs=require('fs'); const f=process.argv[1]; const c=fs.readFileSync(f,'utf8'); if(!c.trim()) { console.error(f+': empty'); process.exit(1); } console.log(f+': OK')\""
+    ]
+  }
+}

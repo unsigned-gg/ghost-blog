@@ -1,0 +1,219 @@
+name: Deploy to GitHub Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_e2e:
+        description: "Skip e2e tests before deploy"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build static site
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpass
+          MYSQL_DATABASE: ghost
+          MYSQL_USER: ghost
+          MYSQL_PASSWORD: ghostpass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint && npm run check:syntax
+
+      - name: Start Ghost
+        run: |
+          docker run -d --name ghost \
+            --network host \
+            -e url=http://localhost:2368 \
+            -e database__client=mysql \
+            -e database__connection__host=127.0.0.1 \
+            -e database__connection__user=ghost \
+            -e database__connection__password=ghostpass \
+            -e database__connection__database=ghost \
+            -e NODE_ENV=development \
+            ghost:5-alpine
+
+      - name: Wait for Ghost
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:2368/ghost/api/admin/site/ > /dev/null 2>&1; then
+              echo "Ghost is up after ~$((i*2))s"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "Ghost failed to start"
+              docker logs ghost
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Bootstrap Ghost
+        run: |
+          curl -sf -X POST http://localhost:2368/ghost/api/admin/authentication/setup/ \
+            -H "Content-Type: application/json" \
+            -d '{
+              "setup": [{
+                "name": "Deploy Bot",
+                "email": "deploy@ghost.local",
+                "password": "Str0ngP@ssword123!",
+                "blogTitle": "Engineering Blog"
+              }]
+            }'
+
+          SESSION=$(curl -sf -D - -o /dev/null -X POST \
+            http://localhost:2368/ghost/api/admin/session/ \
+            -H "Content-Type: application/json" \
+            -H "Origin: http://localhost:2368" \
+            -d '{"username":"deploy@ghost.local","password":"Str0ngP@ssword123!"}' \
+            | grep -i 'set-cookie' | head -1 \
+            | sed 's/.*ghost-admin-api-session=\([^;]*\).*/ghost-admin-api-session=\1/')
+
+          RESULT=$(curl -sf -X POST http://localhost:2368/ghost/api/admin/integrations/ \
+            -H "Content-Type: application/json" \
+            -H "Cookie: ${SESSION}" \
+            -H "Origin: http://localhost:2368" \
+            -d '{"integrations":[{"name":"Deploy Publisher"}]}')
+
+          ADMIN_KEY=$(echo "$RESULT" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          keys = data['integrations'][0]['api_keys']
+          for k in keys:
+              if k['type'] == 'admin':
+                  print(k['secret'] if ':' in k['secret'] else k['id'] + ':' + k['secret'])
+                  break
+          ")
+
+          CONTENT_KEY=$(echo "$RESULT" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          keys = data['integrations'][0]['api_keys']
+          for k in keys:
+              if k['type'] == 'content':
+                  print(k['secret'])
+                  break
+          ")
+
+          echo "GHOST_ADMIN_API_KEY=${ADMIN_KEY}" >> "$GITHUB_ENV"
+          echo "GHOST_CONTENT_API_KEY=${CONTENT_KEY}" >> "$GITHUB_ENV"
+          echo "GHOST_API_URL=http://localhost:2368" >> "$GITHUB_ENV"
+          echo "GHOST_SESSION=${SESSION}" >> "$GITHUB_ENV"
+
+      - name: Configure Ghost (theme, branding, cleanup)
+        run: |
+          # Generate settings payload from Node script
+          node scripts/configure-ghost.mjs --emit-settings > /tmp/ghost-settings.json
+
+          # Delete default "Coming Soon" post
+          POSTS=$(curl -sf "http://localhost:2368/ghost/api/admin/posts/?limit=all" \
+            -H "Cookie: ${GHOST_SESSION}" \
+            -H "Origin: http://localhost:2368")
+          echo "$POSTS" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for p in data.get('posts', []):
+              if p.get('slug') == 'coming-soon':
+                  print(p['id'])
+          " | while read -r pid; do
+            curl -sf -X DELETE "http://localhost:2368/ghost/api/admin/posts/${pid}/" \
+              -H "Cookie: ${GHOST_SESSION}" \
+              -H "Origin: http://localhost:2368"
+            echo "Deleted default post: ${pid}"
+          done
+
+          # Apply settings using the session from Bootstrap
+          RESULT=$(curl -s -w "\n%{http_code}" -X PUT \
+            "http://localhost:2368/ghost/api/admin/settings/" \
+            -H "Content-Type: application/json" \
+            -H "Cookie: ${GHOST_SESSION}" \
+            -H "Origin: http://localhost:2368" \
+            -d @/tmp/ghost-settings.json)
+
+          HTTP_CODE=$(echo "$RESULT" | tail -1)
+          BODY=$(echo "$RESULT" | sed '$d')
+
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "Settings update failed (${HTTP_CODE}): ${BODY}"
+            exit 1
+          fi
+          echo "Ghost settings updated successfully."
+
+      - name: Publish all articles (chronological order)
+        run: |
+          # Sort posts by <!-- date: YYYY-MM-DD --> so Ghost orders them correctly
+          for md in $(grep -l 'date:' content/*.md | xargs grep -oP '<!-- date: \K\d{4}-\d{2}-\d{2}' | sort -t: -k2 | cut -d: -f1); do
+            echo "Publishing: ${md}"
+            node scripts/publish.mjs "$md"
+          done
+          # Publish any posts without a date comment last
+          for md in content/*.md; do
+            if ! grep -q '<!-- date:' "$md"; then
+              echo "Publishing (no date): ${md}"
+              node scripts/publish.mjs "$md"
+            fi
+          done
+
+      - name: Run E2E tests
+        if: ${{ inputs.skip_e2e != true }}
+        run: npm run test:e2e
+
+      - name: Build static mirror
+        run: |
+          bash scripts/build-static.sh _site
+          echo "Static site contents:"
+          find _site -type f | head -50
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Ghost logs (on failure)
+        if: failure()
+        run: docker logs ghost
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
